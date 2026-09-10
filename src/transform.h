@@ -69,18 +69,21 @@ inline int apply(uint8_t *p, uint16_t len, uint8_t rangePct, int8_t transpose) {
   uint8_t running = 0;
 
   while (i < len) {
-    // an optional timestamp-low byte precedes each message
+    // BLE-MIDI layout: header, then [timestamp-low, message]+. The byte in the
+    // timestamp position is 0x80..0xFF — a value >= 0xF8 there is STILL a
+    // timestamp, not a System Real-Time status.
     if (p[i] & 0x80) {
-      if (p[i] >= 0xF8) { ++i; continue; }   // System Real-Time: standalone, no ts
       ++i;                                    // consume timestamp-low
       if (i >= len) break;
     }
+    // else: no timestamp -> running-status continuation
 
     // p[i] is now a status byte, or running-status data
     bool    explicitStatus;
     uint8_t status;
     if (p[i] & 0x80) {
       status = p[i];
+      if (status >= 0xF8) { ++i; continue; }  // System Real-Time: 1 byte, no data
       if (status >= 0xF0) break;              // SysEx / System Common: leave the rest
       running = status;
       explicitStatus = true;

@@ -51,9 +51,10 @@ static const BoardCfg *BOARD = &BOARD_NONTOUCH;
 //                        fabricated / mis-parsed. Correct for a 1:1 router.
 //   (set to 0 only when a future filter/merge/remap feature needs blemidi.h)
 #define RAW_PASSTHROUGH 1
-// LOG_RAW 1 -> hex-dump every inbound "<" / outbound ">" payload on serial.
-// Costs an snprintf + USB-CDC write per MIDI message on the BLE hot path —
-// adds noticeable latency. Debug only; keep 0 for normal use.
+// LOG_RAW 1 -> for every packet, dump the bytes before and after the in-place
+// transforms as a pair ("* " prefix = the transform changed something), so the
+// two can be diffed. Costs a copy + snprintf + USB-CDC write per packet on the
+// pump task. DEBUG ONLY — adds latency; keep 0 for normal use.
 #define LOG_RAW 0
 
 // ------------------------------- display --------------------------------
@@ -119,15 +120,22 @@ static QueueHandle_t g_midiQ    = nullptr;
 static TaskHandle_t  g_pumpTask = nullptr;
 
 #if LOG_RAW
-static void logHex(char dir, const uint8_t *p, size_t n) {
-  char line[3 * RAW_MAX + 8];
-  int o = snprintf(line, sizeof(line), "%c ", dir);
-  for (size_t i = 0; i < n && o < (int)sizeof(line) - 4; ++i)
-    o += snprintf(line + o, sizeof(line) - o, "%02X ", p[i]);
-  Serial.println(line);
+static void hexInto(char *dst, size_t cap, const uint8_t *p, size_t n) {
+  int o = 0;
+  for (size_t i = 0; i < n && o < (int)cap - 4; ++i)
+    o += snprintf(dst + o, cap - o, "%02X ", p[i]);
+  if (o) dst[o - 1] = '\0';
+}
+// Pair-dump one packet before and after the in-place transforms.
+static void logXform(const uint8_t *pre, size_t preLen, const uint8_t *post, size_t postLen) {
+  char a[3 * RAW_MAX], b[3 * RAW_MAX];
+  hexInto(a, sizeof(a), pre, preLen);
+  hexInto(b, sizeof(b), post, postLen);
+  const bool changed = preLen != postLen || memcmp(pre, post, preLen) != 0;
+  Serial.printf("%s xf  in : %s\n        out: %s\n", changed ? "*" : " ", a, b);
 }
 #else
-static inline void logHex(char, const uint8_t *, size_t) {}
+static inline void logXform(const uint8_t *, size_t, const uint8_t *, size_t) {}
 #endif
 
 static char g_failMsg[48] = "";
@@ -227,7 +235,6 @@ static void onSrcNotify(NimBLERemoteCharacteristic *c, uint8_t *data, size_t len
                         bool isNotify) {
   g_rxCount++;
   if (!g_midiQ || len == 0) return;
-  logHex('<', data, len);
 
   RawFrame f;
   f.len = len > RAW_MAX ? RAW_MAX : (uint16_t)len;
@@ -263,8 +270,16 @@ static void midiPumpTask(void *) {
   for (;;) {
     if (xQueueReceive(g_midiQ, &f, pdMS_TO_TICKS(50)) != pdTRUE) continue;
 
-    // in-place packet transforms (CC#52 -> Pitch Bend); length unchanged
+#if LOG_RAW
+    uint8_t  preBuf[RAW_MAX];
+    uint16_t preLen = f.len;
+    memcpy(preBuf, f.data, f.len);
+#endif
+    // in-place packet transforms (CC#52 -> Pitch Bend, transpose); len unchanged
     g_xformCount += xform::apply(f.data, f.len, CC2PB_RANGE_PCT, g_transpose);
+#if LOG_RAW
+    logXform(preBuf, preLen, f.data, f.len);
+#endif
 
     NimBLERemoteCharacteristic *ch = g_tgtChar;
     if (!ch || !g_tgtConn) { g_dropCount++; continue; }
@@ -275,7 +290,6 @@ static void midiPumpTask(void *) {
       if (!ch || !g_tgtConn) { g_dropCount++; break; }
       if (ch->writeValue(f.data, f.len, false)) {
         g_fwdCount++;
-        logHex('>', f.data, f.len);
         break;
       }
       if (++tries >= 8) { g_dropCount++; break; }
