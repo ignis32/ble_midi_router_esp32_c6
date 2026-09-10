@@ -52,59 +52,66 @@ inline uint16_t ccToPitchBend(uint8_t cc, uint8_t rangePct) {
   return (uint16_t)(v < 0 ? 0 : v);
 }
 
-// Walk a BLE-MIDI packet in place:
-//   - each explicit "Bn <CC2PB_CC> vv"     -> Pitch Bend on the same channel
+// Walk a BLE-MIDI packet as a stream of MIDI messages, rewriting in place:
 //   - Note Off / Note On / Poly Aftertouch -> note number += `transpose`
-//     semitones (clamped to 0..127); no-op when transpose == 0
-// `len` never changes. Returns the number of CC->PitchBend rewrites.
+//     semitones (clamped 0..127); handles running-status messages too
+//   - explicit "Bn <CC2PB_CC> vv"          -> Pitch Bend on the same channel
+// `len` never changes. Running status is reset per packet (BLE-MIDI spec).
+// Returns the number of CC->PitchBend rewrites.
 inline int apply(uint8_t *p, uint16_t len, uint8_t rangePct, int8_t transpose) {
 #if !CC2PB_ENABLE
   (void)p; (void)len; (void)rangePct; (void)transpose;
   return 0;
 #else
-  if (len < 4) return 0;
+  if (len < 2) return 0;
   int     hits    = 0;
   size_t  i       = 1;     // skip BLE-MIDI header
-  uint8_t running = 0;     // reset every packet (per BLE-MIDI spec)
+  uint8_t running = 0;
 
   while (i < len) {
-    const uint8_t b = p[i];
-    if (!(b & 0x80)) { ++i; continue; }   // stray data byte
-    if (b >= 0xF8)   { ++i; continue; }   // System Real-Time, standalone
-
-    // b is a timestamp-low byte; the next byte is status or running-status data
-    ++i;
-    if (i >= len) break;
-    const uint8_t s = p[i];
-
-    if (!(s & 0x80)) {                    // running-status data — leave untouched
-      int n = running ? blemidi::dataBytesFor(running) : 1;
-      i += n > 0 ? n : 1;
-      continue;
+    // an optional timestamp-low byte precedes each message
+    if (p[i] & 0x80) {
+      if (p[i] >= 0xF8) { ++i; continue; }   // System Real-Time: standalone, no ts
+      ++i;                                    // consume timestamp-low
+      if (i >= len) break;
     }
-    if (s >= 0xF0) break;                 // SysEx / System Common — leave the rest as-is
-    running = s;
 
-    if ((s & 0xF0) == 0xB0 && i + 2 < len &&
-        p[i + 1] == CC2PB_CC && !(p[i + 2] & 0x80)) {
-      const uint16_t pb = ccToPitchBend(p[i + 2], rangePct);
-      p[i]     = 0xE0 | (s & 0x0F);       // Pitch Bend, same channel
-      p[i + 1] = pb & 0x7F;              // LSB (7 bits)
-      p[i + 2] = (pb >> 7) & 0x7F;       // MSB (7 bits)
+    // p[i] is now a status byte, or running-status data
+    bool    explicitStatus;
+    uint8_t status;
+    if (p[i] & 0x80) {
+      status = p[i];
+      if (status >= 0xF0) break;              // SysEx / System Common: leave the rest
+      running = status;
+      explicitStatus = true;
+      ++i;
+    } else {
+      if (running == 0 || running >= 0xF0) { ++i; continue; }
+      status = running;                       // running status: reuse prior status
+      explicitStatus = false;
+    }
+
+    const int need = blemidi::dataBytesFor(status);   // data bytes for this msg
+    if (need <= 0 || i + need > len) break;           // truncated
+    const uint8_t hi = status & 0xF0;
+
+    // CC#CC2PB_CC -> Pitch Bend (rewrites the status byte, so explicit only)
+    if (explicitStatus && hi == 0xB0 && need == 2 &&
+        p[i] == CC2PB_CC && !(p[i + 1] & 0x80)) {
+      const uint16_t pb = ccToPitchBend(p[i + 1], rangePct);
+      p[i - 1] = 0xE0 | (status & 0x0F);      // the status byte we just passed
+      p[i]     = pb & 0x7F;
+      p[i + 1] = (pb >> 7) & 0x7F;
+      running  = p[i - 1];                    // keep running status coherent
       ++hits;
-      i += 3;
-      continue;
+    }
+    // transpose Note Off / Note On / Poly Key Pressure (data[0] = note number)
+    else if (transpose != 0 && (hi == 0x80 || hi == 0x90 || hi == 0xA0) &&
+             !(p[i] & 0x80)) {
+      p[i] = clamp7((int)p[i] + transpose);
     }
 
-    // transpose Note Off / Note On / Poly Key Pressure (byte 1 = note number)
-    if (transpose != 0) {
-      const uint8_t hi = s & 0xF0;
-      if ((hi == 0x80 || hi == 0x90 || hi == 0xA0) &&
-          i + 1 < len && !(p[i + 1] & 0x80)) {
-        p[i + 1] = clamp7((int)p[i + 1] + transpose);
-      }
-    }
-    i += 1 + blemidi::dataBytesFor(s);   // advance past this message
+    i += need;
   }
   return hits;
 #endif
