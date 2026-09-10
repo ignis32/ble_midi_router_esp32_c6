@@ -235,6 +235,27 @@ static void onSrcNotify(NimBLERemoteCharacteristic *c, uint8_t *data, size_t len
   if (xQueueSend(g_midiQ, &f, 0) != pdTRUE) g_dropCount++;   // queue full
 }
 
+// Queue All Notes Off (CC123) + All Sound Off (CC120) on every channel.
+// Used when transpose changes so a note held across the switch can't hang.
+static void enqueuePanic() {
+  if (!g_midiQ) return;
+  const uint16_t ts   = millis() & 0x1FFF;
+  const uint8_t  hdr  = 0x80 | ((ts >> 7) & 0x3F);
+  const uint8_t  tsLo = 0x80 | (ts & 0x7F);
+  for (uint8_t cc : {(uint8_t)123, (uint8_t)120}) {
+    for (uint8_t ch = 0; ch < 16; ++ch) {
+      RawFrame f;
+      f.len = 5;
+      f.data[0] = hdr;
+      f.data[1] = tsLo;
+      f.data[2] = 0xB0 | ch;
+      f.data[3] = cc;
+      f.data[4] = 0x00;
+      xQueueSend(g_midiQ, &f, 0);
+    }
+  }
+}
+
 // Consumer: forwards each source notification payload to the target verbatim,
 // one write per packet, with backoff on a congested stack.
 static void midiPumpTask(void *) {
@@ -714,7 +735,8 @@ void loop() {
           if (TRANSPOSE_STEPS[k] == g_transpose) { idx = k; break; }
         g_transpose = TRANSPOSE_STEPS[(idx + 1) % n];
         saveTranspose();
-        Serial.printf("[MIDI-RT] transpose = %+d\n", g_transpose);
+        enqueuePanic();   // clear notes held across the change
+        Serial.printf("[MIDI-RT] transpose = %+d (panic sent)\n", g_transpose);
         lastDraw = 0;   // redraw immediately
       } else if (btn == Press::Long) {
         teardownLinks();
