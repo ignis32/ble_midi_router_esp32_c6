@@ -327,20 +327,58 @@ class TgtCliCB : public NimBLEClientCallbacks {
 static SrcCliCB g_srcCliCB;
 static TgtCliCB g_tgtCliCB;
 
+static int g_failStreak = 0;
+
 static void fail(const char *msg) {
+  ++g_failStreak;
   strncpy(g_failMsg, msg, sizeof(g_failMsg) - 1);
-  Serial.printf("[MIDI-RT] FAIL: %s\n", msg);
+  Serial.printf("[MIDI-RT] FAIL: %s (streak %d)\n", msg, g_failStreak);
   g_state = State::Failed;
 }
 
+static NimBLERemoteCharacteristic *g_srcChar = nullptr;   // held between connect & subscribe
+
+// Tear down ONE link and wait for it to actually go. deleteClient() on a still-
+// connected client only *starts* an async disconnect; reconnecting before the
+// client object is freed leaks a controller connection slot (only 3 exist) and
+// wedges the stack until a full power cycle.
+static void teardownLink(bool source) {
+  if (source) { g_srcChar = nullptr; g_srcConn = false; }
+  else        { g_tgtChar = nullptr; g_tgtConn = false; }
+
+  NimBLEClient *&cli = source ? g_srcCli : g_tgtCli;
+  if (!cli) return;
+
+  const size_t before = NimBLEDevice::getCreatedClientCount();
+  NimBLEDevice::deleteClient(cli);
+  cli = nullptr;
+
+  const uint32_t t0 = millis();
+  while (NimBLEDevice::getCreatedClientCount() >= before && millis() - t0 < 2500)
+    delay(20);
+}
 static void teardownLinks() {
-  if (g_srcCli) { NimBLEDevice::deleteClient(g_srcCli); g_srcCli = nullptr; }
-  if (g_tgtCli) { NimBLEDevice::deleteClient(g_tgtCli); g_tgtCli = nullptr; }
-  g_tgtChar = nullptr;
-  g_srcConn = g_tgtConn = false;
+  teardownLink(true);
+  teardownLink(false);
 }
 
-static NimBLERemoteCharacteristic *g_srcChar = nullptr;   // held between connect & subscribe
+// Nuclear recovery: fully restart the BLE stack. Frees any leaked connection
+// slots on our side, and our disappearance lets the peers drop their stale
+// links via supervision timeout.
+static void bleRestart() {
+  Serial.println("[MIDI-RT] BLE stack restart");
+  teardownLinks();
+  NimBLEDevice::deinit(true);
+  delay(400);
+  NimBLEDevice::init("MIDI-Router");
+  NimBLEDevice::setPower(3);
+  NimBLEDevice::setMTU(128);
+  NimBLEDevice::setSecurityAuth(true, false, false);
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+  g_srcConn = g_tgtConn = false;
+  g_srcChar = g_tgtChar = nullptr;
+  g_failStreak = 0;
+}
 
 // connect + discover the MIDI characteristic. Does NOT subscribe (source).
 static bool connectOne(bool source) {
@@ -383,10 +421,15 @@ static bool connectOne(bool source) {
 }
 
 static bool connectWithRetry(bool source, int tries) {
+  const size_t keep = source && g_tgtConn ? 1 : (!source && g_srcConn ? 1 : 0);
   for (int i = 1; i <= tries; ++i) {
     if (connectOne(source)) return true;
     Serial.printf("[MIDI-RT] %s connect attempt %d/%d failed\n",
                   source ? "SRC" : "TGT", i, tries);
+    // let the failed/cancelled client object be freed before the next try
+    const uint32_t t0 = millis();
+    while (NimBLEDevice::getCreatedClientCount() > keep && millis() - t0 < 1500)
+      delay(20);
     vTaskDelay(pdMS_TO_TICKS(800));
   }
   return false;
@@ -395,30 +438,36 @@ static bool connectWithRetry(bool source, int tries) {
 static void drawStatus(const char *line1, const char *line2);
 
 static void doConnect() {
-  teardownLinks();
-  g_srcChar = nullptr;
   g_linkLost = false;
   if (g_midiQ) xQueueReset(g_midiQ);
 
-  // Target first (idle radio), then source. Subscribing to the source starts
-  // the notification flood, so do that last once both links are up.
-  drawStatus("Connecting to", "TARGET ...");
-  Serial.println("[MIDI-RT] connecting TARGET...");
-  if (!connectWithRetry(false, 3)) { fail("TARGET connect failed"); return; }
-  Serial.printf("[MIDI-RT] TARGET connected, MTU=%u\n",
-                g_tgtCli ? g_tgtCli->getMTU() : 0);
+  // Drop only the dead side(s); a healthy link stays up and is left alone.
+  if (!g_tgtConn) teardownLink(false);
+  if (!g_srcConn) teardownLink(true);
 
-  drawStatus("Connecting to", "SOURCE ...");
-  Serial.println("[MIDI-RT] connecting SOURCE...");
-  if (!connectWithRetry(true, 3)) { fail("SOURCE connect failed"); return; }
-
-  if (!g_srcChar || !g_srcChar->canNotify() ||
-      !g_srcChar->subscribe(true, onSrcNotify)) {
-    fail("SOURCE subscribe failed");
-    return;
+  // Target first (idle radio); subscribing to Source starts the notify flood.
+  if (!g_tgtConn) {
+    drawStatus("Connecting to", "TARGET ...");
+    Serial.println("[MIDI-RT] connecting TARGET...");
+    if (!connectWithRetry(false, 4)) { fail("TARGET connect failed"); return; }
+    Serial.printf("[MIDI-RT] TARGET connected, MTU=%u\n",
+                  g_tgtCli ? g_tgtCli->getMTU() : 0);
   }
-  Serial.println("[MIDI-RT] SOURCE subscribed -> ROUTING");
 
+  if (!g_srcConn) {
+    drawStatus("Connecting to", "SOURCE ...");
+    Serial.println("[MIDI-RT] connecting SOURCE...");
+    if (!connectWithRetry(true, 4)) { fail("SOURCE connect failed"); return; }
+    if (!g_srcChar || !g_srcChar->canNotify() ||
+        !g_srcChar->subscribe(true, onSrcNotify)) {
+      fail("SOURCE subscribe failed");
+      return;
+    }
+    Serial.println("[MIDI-RT] SOURCE subscribed");
+  }
+
+  g_failStreak = 0;
+  Serial.println("[MIDI-RT] -> ROUTING");
   g_rxCount = g_fwdCount = g_dropCount = g_xformCount = 0;
   g_lastMsgLen = 0;
   g_state = State::Routing;
@@ -802,6 +851,7 @@ void loop() {
         g_state = State::ScanSource;
       } else if (millis() - failedAt > 4000) {
         failedAt = 0;
+        if (g_failStreak >= 3) bleRestart();   // stuck: restart the BLE stack
         Serial.println("[MIDI-RT] auto-retry after failure");
         g_state = State::Connecting;
       } else {
