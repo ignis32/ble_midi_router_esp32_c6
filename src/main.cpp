@@ -102,6 +102,8 @@ static volatile bool  g_linkLost = false;
 
 static volatile uint32_t g_rxCount = 0, g_fwdCount = 0, g_dropCount = 0;
 static volatile uint32_t g_xformCount = 0;   // CC->PitchBend rewrites
+static uint8_t g_pbRangePct = CC2PB_RANGE_PCT;   // live-adjustable bend depth
+static const uint8_t PB_RANGE_STEPS[] = {100, 75, 50, 33, 25, 15, 10, 5};
 static uint8_t  g_lastMsg[12];
 static uint8_t  g_lastMsgLen = 0;
 static uint32_t g_lastMsgAt  = 0;
@@ -155,10 +157,16 @@ static bool loadPair() {
   g_tgtAddr = g_prefs.getULong64("tgt", 0);
   g_srcType = g_prefs.getUChar("srcT", 0);
   g_tgtType = g_prefs.getUChar("tgtT", 0);
+  g_pbRangePct = g_prefs.getUChar("pbrng", CC2PB_RANGE_PCT);
   g_prefs.end();
   g_srcSet = g_srcAddr != 0;
   g_tgtSet = g_tgtAddr != 0;
   return g_srcSet && g_tgtSet;
+}
+static void savePbRange() {
+  g_prefs.begin("midirt", false);
+  g_prefs.putUChar("pbrng", g_pbRangePct);
+  g_prefs.end();
 }
 
 // --------------------------- board detection ---------------------------
@@ -235,7 +243,7 @@ static void midiPumpTask(void *) {
     if (xQueueReceive(g_midiQ, &f, pdMS_TO_TICKS(50)) != pdTRUE) continue;
 
     // in-place packet transforms (CC#52 -> Pitch Bend); length unchanged
-    g_xformCount += xform::apply(f.data, f.len);
+    g_xformCount += xform::apply(f.data, f.len, g_pbRangePct);
 
     NimBLERemoteCharacteristic *ch = g_tgtChar;
     if (!ch || !g_tgtConn) { g_dropCount++; continue; }
@@ -502,8 +510,13 @@ static void drawRouting() {
   gfx->setCursor(4, 140);
   gfx->printf("fwd : %lu", (unsigned long)g_fwdCount);
 #if CC2PB_ENABLE
+  gfx->setCursor(90, 126);
+  gfx->printf("cc%d>pb", CC2PB_CC);
   gfx->setCursor(90, 140);
-  gfx->printf("cc%d>pb:%lu", CC2PB_CC, (unsigned long)g_xformCount);
+  gfx->printf("%lu", (unsigned long)g_xformCount);
+  gfx->setTextColor(COL_GOOD);
+  gfx->setCursor(90, 154);
+  gfx->printf("bend %u%%", g_pbRangePct);
 #endif
   if (g_dropCount) {
     gfx->setTextColor(COL_BAD);
@@ -531,7 +544,7 @@ static void drawRouting() {
 
   gfx->setTextColor(COL_DIM);
   gfx->setCursor(4, SCREEN_H - 22);
-  gfx->print("short: reset counters");
+  gfx->print("short: bend depth");
   gfx->setCursor(4, SCREEN_H - 10);
   gfx->print("long : forget + rescan");
   gfx->flush();
@@ -694,8 +707,14 @@ void loop() {
       }
       static uint32_t lastDraw = 0;
       if (btn == Press::Short) {
-        g_rxCount = g_fwdCount = g_dropCount = g_xformCount = 0;
-        g_lastMsgLen = 0;
+        // cycle the CC->Pitch Bend depth and persist it
+        size_t n = sizeof(PB_RANGE_STEPS) / sizeof(PB_RANGE_STEPS[0]);
+        size_t idx = 0;
+        for (size_t k = 0; k < n; ++k)
+          if (PB_RANGE_STEPS[k] == g_pbRangePct) { idx = k; break; }
+        g_pbRangePct = PB_RANGE_STEPS[(idx + 1) % n];
+        savePbRange();
+        Serial.printf("[MIDI-RT] pb range = %u%%\n", g_pbRangePct);
         lastDraw = 0;   // redraw immediately
       } else if (btn == Press::Long) {
         teardownLinks();
@@ -711,9 +730,10 @@ void loop() {
       if (millis() - lastHb > 2000) {
         lastHb = millis();
         if (g_fwdCount != lastFwd) {
-          Serial.printf("[MIDI-RT] rx=%lu fwd=%lu drop=%lu cc2pb=%lu last=",
+          Serial.printf("[MIDI-RT] rx=%lu fwd=%lu drop=%lu cc2pb=%lu(%u%%) last=",
                         (unsigned long)g_rxCount, (unsigned long)g_fwdCount,
-                        (unsigned long)g_dropCount, (unsigned long)g_xformCount);
+                        (unsigned long)g_dropCount, (unsigned long)g_xformCount,
+                        g_pbRangePct);
           for (int i = 0; i < g_lastMsgLen; ++i) Serial.printf("%02X ", g_lastMsg[i]);
           Serial.println();
           lastFwd = g_fwdCount;

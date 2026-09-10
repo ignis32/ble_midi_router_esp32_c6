@@ -30,10 +30,11 @@ namespace xform {
 
 // CC 0..127 (centre 64) -> 14-bit pitch bend 0..16383 (centre 8192).
 // Dead zone around 64; leaving it, the bend ramps from centre (no step).
-inline uint16_t ccToPitchBend(uint8_t cc) {
+// rangePct (1..100) caps the bend depth at the CC extremes.
+inline uint16_t ccToPitchBend(uint8_t cc, uint8_t rangePct) {
   const int   centre = 64;
   const int   dz     = CC2PB_DEADZONE;
-  const float scale  = CC2PB_RANGE_PCT / 100.0f;
+  const float scale  = rangePct / 100.0f;
   const int   d      = (int)cc - centre;
 
   if (d >= -dz && d <= dz) return 8192;
@@ -51,9 +52,9 @@ inline uint16_t ccToPitchBend(uint8_t cc) {
 
 // Walk a BLE-MIDI packet, rewriting each explicit "Bn <CC2PB_CC> vv" in place.
 // Returns the number of messages rewritten. `len` never changes.
-inline int apply(uint8_t *p, uint16_t len) {
+inline int apply(uint8_t *p, uint16_t len, uint8_t rangePct) {
 #if !CC2PB_ENABLE
-  (void)p; (void)len;
+  (void)p; (void)len; (void)rangePct;
   return 0;
 #else
   if (len < 4) return 0;
@@ -81,7 +82,7 @@ inline int apply(uint8_t *p, uint16_t len) {
 
     if ((s & 0xF0) == 0xB0 && i + 2 < len &&
         p[i + 1] == CC2PB_CC && !(p[i + 2] & 0x80)) {
-      const uint16_t pb = ccToPitchBend(p[i + 2]);
+      const uint16_t pb = ccToPitchBend(p[i + 2], rangePct);
       p[i]     = 0xE0 | (s & 0x0F);       // Pitch Bend, same channel
       p[i + 1] = pb & 0x7F;              // LSB (7 bits)
       p[i + 2] = (pb >> 7) & 0x7F;       // MSB (7 bits)

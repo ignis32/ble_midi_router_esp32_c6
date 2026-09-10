@@ -37,9 +37,11 @@ Probes the I2C bus (GPIO18/19) for the touch controller / IMU and picks pins:
   **in place** to a Pitch Bend on the same channel before the write. CC and
   Pitch Bend are both 3-byte messages, so the packet is otherwise untouched.
   Curve: dead zone of `CC2PB_DEADZONE` either side of 64 -> bend centre; past
-  it the bend ramps from centre (no jump); `CC2PB_RANGE_PCT` caps the depth at
-  the CC extremes. Resolution is 7-bit (~62 steps/side) — slow sweeps can
-  step; slew/interpolation is a TODO.
+  it the bend ramps from centre (no jump). Depth is `CC2PB_RANGE_PCT` % of the
+  full 14-bit range at the CC extremes (audible width = that x the synth's own
+  bend range) and is **live-adjustable** with a short BOOT press on the ROUTING
+  screen (persisted to NVS). Resolution is 7-bit (~62 steps/side) — slow sweeps
+  can step; slew/interpolation is a TODO.
 - **Pipeline:** the notify callback (BLE host task) only copies the payload
   into a fixed-size FreeRTOS queue; a separate pump task does the writes with
   ENOMEM backoff. Writing unpaced from the callback exhausts the mbuf pool and
@@ -57,7 +59,7 @@ Probes the I2C bus (GPIO18/19) for the touch controller / IMU and picks pins:
 | Screen | Short press | Long press (>0.6 s) |
 |---|---|---|
 | Pick SOURCE / TARGET | move cursor | select highlighted device |
-| ROUTING | reset rx/fwd counters | forget pair + rescan |
+| ROUTING | cycle CC->PitchBend depth (100/75/50/33/25/15/10/5 %, saved to NVS) | forget pair + rescan |
 | ERROR | retry connect | forget pair + rescan |
 
 Hold BOOT **while powering on** to skip the stored pair and rescan.
