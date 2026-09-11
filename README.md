@@ -1,12 +1,17 @@
 # BLE MIDI Router
 
 Firmware for a Waveshare ESP32-C6 1.47" LCD board that bridges two BLE-MIDI
-devices: pick a **Source** and a **Target** on the little screen, and it
-forwards MIDI between them over Bluetooth — no phone or laptop needed in
+peripheral devices: pick a **Source** and a **Target** on the little screen, and
+it forwards MIDI between them over Bluetooth — no phone or laptop needed in
 between.
 
-Built to connect an [Artinoise Re.corder](https://artinoise.com/) BLE flute
-straight into a synth.
+I made it for myself, to connect an [Artinoise Re.corder](https://artinoise.com/)
+BLE flute straight into an M-Vave FM1 synth.
+
+For the Re.corder specifically, it also maps CC 52 into Pitch Bend with a dead
+zone (`ENABLE_CC_TO_PITCHBEND 1` in `config.h`).
+
+Latency is surprisingly okay.
 
 ## Features
 
