@@ -23,7 +23,8 @@ Latency is surprisingly okay.
 ## Hardware
 
 - [Waveshare ESP32-C6-LCD-1.47](https://www.waveshare.com/esp32-c6-lcd-1.47.htm)
-  (the Touch variant works too — auto-detected)
+  (auto-detects the Touch variant too and should work — but only the
+  non-touch board has actually been tested)
 
 ## Build & flash
 

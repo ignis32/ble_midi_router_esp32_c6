@@ -16,6 +16,14 @@ Probes the I2C bus (GPIO18/19) for the touch controller / IMU and picks pins:
 | BOOT button | GPIO9 | GPIO8 |
 | Flash | 4 MB | 8 MB |
 
+Only the non-touch board has actually been run. The Touch branch should work —
+pin profile and detection are in `board.cpp` — but the JD9853 panel is only
+*assumed* ST7789-compatible (see the comment on `Arduino_ST7789` in
+`display.cpp`); nobody has confirmed it actually renders correctly. If it
+doesn't, switch to LovyanGFX's `Panel_JD9853` for that board. Touch input and
+the IMU are never read either way — navigation is BOOT-button-only regardless
+of which board you're on.
+
 ## Project layout
 
 ```
