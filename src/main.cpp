@@ -11,12 +11,20 @@
 //  Topology: this board is central to BOTH devices, so both must be BLE-MIDI
 //  peripherals (keyboards, WIDI, most synths). Forwarding to a host that is
 //  itself a BLE central (phone / PC) is out of scope here.
+//
+//  Forwarding is raw passthrough: each Source notification payload is copied
+//  to the Target characteristic verbatim, with no MIDI parsing, so nothing
+//  can be fabricated or mis-parsed. Optional in-place packet transforms run
+//  just before the write -- see config.h and src/transforms/.
+//
+//  This file is the app: board/BLE bring-up, the BLE-central connection
+//  management, and the screen state machine. Display rendering is in
+//  display.*, board detection in board.*, and MIDI transforms in
+//  transforms/*, all driven from config.h.
 // ---------------------------------------------------------------------------
 
 #include <Arduino.h>
-#include <Wire.h>
 #include <Preferences.h>
-#include <Arduino_GFX_Library.h>
 #include <NimBLEDevice.h>
 
 #include <algorithm>
@@ -27,58 +35,17 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
+#include "config.h"
+#include "board.h"
+#include "display.h"
 #include "blemidi.h"
-#include "transform.h"
-
-// --------------------------- board definitions ---------------------------
-struct BoardCfg {
-  const char *name;
-  int mosi, sck, cs, dc, rst, bl, btn;
-  bool jd9853;
-};
-static const BoardCfg BOARD_NONTOUCH = {
-    "ESP32-C6-LCD-1.47", 6, 7, 14, 15, 21, 22, 9, false};
-static const BoardCfg BOARD_TOUCH = {
-    "ESP32-C6-Touch-LCD-1.47", 2, 1, 14, 15, 22, 23, 8, true};
-
-static constexpr int I2C_SDA = 18, I2C_SCL = 19;
-static constexpr uint8_t ADDR_AXS5106L = 0x63, ADDR_QMI8658 = 0x6B;
-static const BoardCfg *BOARD = &BOARD_NONTOUCH;
-
-// Forwarding mode:
-//   RAW_PASSTHROUGH 1 -> copy the source notification payload to the target
-//                        verbatim. No MIDI parsing, so nothing can be
-//                        fabricated / mis-parsed. Correct for a 1:1 router.
-//   (set to 0 only when a future filter/merge/remap feature needs blemidi.h)
-#define RAW_PASSTHROUGH 1
-// LOG_RAW 1 -> for every packet, dump the bytes before and after the in-place
-// transforms as a pair ("* " prefix = the transform changed something), so the
-// two can be diffed. Costs a copy + snprintf + USB-CDC write per packet on the
-// pump task. DEBUG ONLY — adds latency; keep 0 for normal use.
-#define LOG_RAW 0
-
-// ------------------------------- display --------------------------------
-static constexpr int16_t SCREEN_W = 172, SCREEN_H = 320;
-static constexpr uint8_t ROTATION = 0;
-#define USE_CANVAS 1
-
-Arduino_DataBus *bus   = nullptr;
-Arduino_GFX     *panel = nullptr;
-Arduino_GFX     *gfx   = nullptr;
-
-static constexpr uint16_t COL_BG     = 0x0000;
-static constexpr uint16_t COL_HDR    = 0x001F;   // blue  (selection screens)
-static constexpr uint16_t COL_HDR_OK = 0x05E0;   // green (routing screen)
-static constexpr uint16_t COL_TEXT   = 0xFFFF;
-static constexpr uint16_t COL_DIM    = 0xC618;
-static constexpr uint16_t COL_SEP    = 0x2104;
-static constexpr uint16_t COL_CURSOR = 0x033F;
-static constexpr uint16_t COL_GOOD   = 0x07E0;
-static constexpr uint16_t COL_BAD    = 0xF800;
+#include "transforms/transform_chain.h"
+#include "transforms/transpose.h"
 
 // ------------------------------- state ----------------------------------
 enum class State { ScanSource, ScanTarget, Connecting, Routing, Failed };
 static State g_state = State::ScanSource;
+static const BoardProfile *g_board = nullptr;
 
 struct Found {
   uint64_t    addr;      // NimBLEAddress as uint64
@@ -95,98 +62,83 @@ static uint64_t g_srcAddr = 0, g_tgtAddr = 0;
 static uint8_t  g_srcType = 0, g_tgtType = 0;
 static bool     g_srcSet  = false, g_tgtSet = false;
 
-static NimBLEClient             *g_srcCli  = nullptr;
-static NimBLEClient             *g_tgtCli  = nullptr;
+static NimBLEClient               *g_srcCli  = nullptr;
+static NimBLEClient               *g_tgtCli  = nullptr;
+static NimBLERemoteCharacteristic *g_srcChar = nullptr;   // held between connect & subscribe
 static NimBLERemoteCharacteristic *g_tgtChar = nullptr;
 static volatile bool  g_srcConn = false, g_tgtConn = false;
 static volatile bool  g_linkLost = false;
 
 static volatile uint32_t g_rxCount = 0, g_fwdCount = 0, g_dropCount = 0;
-static volatile uint32_t g_xformCount = 0;   // CC->PitchBend rewrites
-static int8_t g_transpose = 0;               // semitones, BOOT-cycled on ROUTING
-static const int8_t TRANSPOSE_STEPS[] = {0, 12, -12};
+static volatile uint32_t g_xformCount = 0;   // notable transform rewrites (e.g. CC->PitchBend)
 static uint8_t  g_lastMsg[12];
 static uint8_t  g_lastMsgLen = 0;
 static uint32_t g_lastMsgAt  = 0;
 
-// source notify (producer, BLE host task) -> pump task (consumer, writes target).
-// One queue entry = one whole source notification payload, forwarded verbatim.
-static constexpr uint16_t RAW_MAX = 160;   // >= any MTU-3 we negotiate (128)
+static int  g_failStreak = 0;
+static char g_failMsg[48] = "";
+
+static Preferences g_prefs;
+
+// Source notify (producer, BLE host task) -> pump task (consumer, writes
+// target). One queue entry = one whole source notification payload.
 struct RawFrame {
   uint16_t len;
-  uint8_t  data[RAW_MAX];
+  uint8_t  data[MIDI_RAW_MAX_BYTES];
 };
 static QueueHandle_t g_midiQ    = nullptr;
 static TaskHandle_t  g_pumpTask = nullptr;
 
-#if LOG_RAW
+#if DEBUG_LOG_TRANSFORMS
 static void hexInto(char *dst, size_t cap, const uint8_t *p, size_t n) {
   int o = 0;
   for (size_t i = 0; i < n && o < (int)cap - 4; ++i)
     o += snprintf(dst + o, cap - o, "%02X ", p[i]);
   if (o) dst[o - 1] = '\0';
 }
-// Pair-dump one packet before and after the in-place transforms.
-static void logXform(const uint8_t *pre, size_t preLen, const uint8_t *post, size_t postLen) {
-  char a[3 * RAW_MAX], b[3 * RAW_MAX];
+// Pair-dump one packet before and after the transform chain.
+static void logTransform(const uint8_t *pre, size_t preLen, const uint8_t *post, size_t postLen) {
+  char a[3 * MIDI_RAW_MAX_BYTES], b[3 * MIDI_RAW_MAX_BYTES];
   hexInto(a, sizeof(a), pre, preLen);
   hexInto(b, sizeof(b), post, postLen);
   const bool changed = preLen != postLen || memcmp(pre, post, preLen) != 0;
   Serial.printf("%s xf  in : %s\n        out: %s\n", changed ? "*" : " ", a, b);
 }
-#else
-static inline void logXform(const uint8_t *, size_t, const uint8_t *, size_t) {}
 #endif
-
-static char g_failMsg[48] = "";
-
-static Preferences g_prefs;
 
 // ------------------------------- helpers --------------------------------
 static NimBLEUUID midiSvcUuid() { return NimBLEUUID(blemidi::SERVICE_UUID); }
 
 static void savePair() {
-  g_prefs.begin("midirt", false);
-  g_prefs.putULong64("src", g_srcAddr);
-  g_prefs.putULong64("tgt", g_tgtAddr);
-  g_prefs.putUChar("srcT", g_srcType);
-  g_prefs.putUChar("tgtT", g_tgtType);
+  g_prefs.begin(NVS_NAMESPACE, false);
+  g_prefs.putULong64(NVS_KEY_SRC_ADDR, g_srcAddr);
+  g_prefs.putULong64(NVS_KEY_TGT_ADDR, g_tgtAddr);
+  g_prefs.putUChar(NVS_KEY_SRC_TYPE, g_srcType);
+  g_prefs.putUChar(NVS_KEY_TGT_TYPE, g_tgtType);
   g_prefs.end();
 }
 static void forgetPair() {
-  g_prefs.begin("midirt", false);
+  g_prefs.begin(NVS_NAMESPACE, false);
   g_prefs.clear();
   g_prefs.end();
   g_srcSet = g_tgtSet = false;
 }
 static bool loadPair() {
-  g_prefs.begin("midirt", true);
-  g_srcAddr = g_prefs.getULong64("src", 0);
-  g_tgtAddr = g_prefs.getULong64("tgt", 0);
-  g_srcType = g_prefs.getUChar("srcT", 0);
-  g_tgtType = g_prefs.getUChar("tgtT", 0);
-  g_transpose = g_prefs.getChar("xpose", 0);
+  g_prefs.begin(NVS_NAMESPACE, true);
+  g_srcAddr = g_prefs.getULong64(NVS_KEY_SRC_ADDR, 0);
+  g_tgtAddr = g_prefs.getULong64(NVS_KEY_TGT_ADDR, 0);
+  g_srcType = g_prefs.getUChar(NVS_KEY_SRC_TYPE, 0);
+  g_tgtType = g_prefs.getUChar(NVS_KEY_TGT_TYPE, 0);
+  transpose::set(g_prefs.getChar(NVS_KEY_TRANSPOSE, 0));
   g_prefs.end();
   g_srcSet = g_srcAddr != 0;
   g_tgtSet = g_tgtAddr != 0;
   return g_srcSet && g_tgtSet;
 }
 static void saveTranspose() {
-  g_prefs.begin("midirt", false);
-  g_prefs.putChar("xpose", g_transpose);
+  g_prefs.begin(NVS_NAMESPACE, false);
+  g_prefs.putChar(NVS_KEY_TRANSPOSE, transpose::get());
   g_prefs.end();
-}
-
-// --------------------------- board detection ---------------------------
-static bool i2cPresent(uint8_t a) {
-  Wire.beginTransmission(a);
-  return Wire.endTransmission() == 0;
-}
-static const BoardCfg *detectBoard() {
-  Wire.begin(I2C_SDA, I2C_SCL, 100000);
-  delay(20);
-  return (i2cPresent(ADDR_AXS5106L) || i2cPresent(ADDR_QMI8658)) ? &BOARD_TOUCH
-                                                                 : &BOARD_NONTOUCH;
 }
 
 // ----------------------------- BLE scanning ---------------------------
@@ -219,8 +171,8 @@ static void startScan() {
   NimBLEScan *s = NimBLEDevice::getScan();
   s->setScanCallbacks(&g_scanCB, false);
   s->setActiveScan(true);
-  s->setInterval(80);
-  s->setWindow(40);
+  s->setInterval(BLE_SCAN_INTERVAL);
+  s->setWindow(BLE_SCAN_WINDOW);
   s->setMaxResults(0);
   s->start(0, false, true);
 }
@@ -231,13 +183,12 @@ static void stopScan() { NimBLEDevice::getScan()->stop(); }
 // writes here (writing unpaced from this context exhausts the mbuf pool ->
 // ENOMEM -> the link drops) and NO parsing (raw passthrough can't fabricate
 // or mis-parse anything). The pump task does the writing.
-static void onSrcNotify(NimBLERemoteCharacteristic *c, uint8_t *data, size_t len,
-                        bool isNotify) {
+static void onSrcNotify(NimBLERemoteCharacteristic *c, uint8_t *data, size_t len, bool isNotify) {
   g_rxCount++;
   if (!g_midiQ || len == 0) return;
 
   RawFrame f;
-  f.len = len > RAW_MAX ? RAW_MAX : (uint16_t)len;
+  f.len = len > MIDI_RAW_MAX_BYTES ? MIDI_RAW_MAX_BYTES : (uint16_t)len;
   memcpy(f.data, data, f.len);
   if (xQueueSend(g_midiQ, &f, 0) != pdTRUE) g_dropCount++;   // queue full
 }
@@ -263,22 +214,21 @@ static void enqueuePanic() {
   }
 }
 
-// Consumer: forwards each source notification payload to the target verbatim,
-// one write per packet, with backoff on a congested stack.
+// Consumer: runs the transform chain, then forwards each packet to the
+// target verbatim, one write per packet, with backoff on a congested stack.
 static void midiPumpTask(void *) {
   RawFrame f;
   for (;;) {
     if (xQueueReceive(g_midiQ, &f, pdMS_TO_TICKS(50)) != pdTRUE) continue;
 
-#if LOG_RAW
-    uint8_t  preBuf[RAW_MAX];
+#if DEBUG_LOG_TRANSFORMS
+    uint8_t  preBuf[MIDI_RAW_MAX_BYTES];
     uint16_t preLen = f.len;
     memcpy(preBuf, f.data, f.len);
 #endif
-    // in-place packet transforms (CC#52 -> Pitch Bend, transpose); len unchanged
-    g_xformCount += xform::apply(f.data, f.len, CC2PB_RANGE_PCT, g_transpose);
-#if LOG_RAW
-    logXform(preBuf, preLen, f.data, f.len);
+    g_xformCount += transforms::apply(f.data, f.len);   // in place; len unchanged
+#if DEBUG_LOG_TRANSFORMS
+    logTransform(preBuf, preLen, f.data, f.len);
 #endif
 
     NimBLERemoteCharacteristic *ch = g_tgtChar;
@@ -292,8 +242,8 @@ static void midiPumpTask(void *) {
         g_fwdCount++;
         break;
       }
-      if (++tries >= 8) { g_dropCount++; break; }
-      vTaskDelay(pdMS_TO_TICKS(3));   // let the stack drain, then retry
+      if (++tries >= MIDI_WRITE_RETRIES) { g_dropCount++; break; }
+      vTaskDelay(pdMS_TO_TICKS(MIDI_WRITE_RETRY_DELAY_MS));   // let the stack drain
     }
 
     const uint8_t n = f.len < sizeof(g_lastMsg) ? f.len : sizeof(g_lastMsg);
@@ -304,20 +254,16 @@ static void midiPumpTask(void *) {
 }
 
 class SrcCliCB : public NimBLEClientCallbacks {
-  void onConnect(NimBLEClient *c) override {
-    Serial.println("[MIDI-RT] SRC onConnect");
-  }
-  void onDisconnect(NimBLEClient *c, int reason) override {
+  void onConnect(NimBLEClient *) override { Serial.println("[MIDI-RT] SRC onConnect"); }
+  void onDisconnect(NimBLEClient *, int reason) override {
     Serial.printf("[MIDI-RT] SRC onDisconnect reason=%d (0x%02X)\n", reason, reason & 0xFF);
     g_srcConn = false;
     g_linkLost = true;
   }
 };
 class TgtCliCB : public NimBLEClientCallbacks {
-  void onConnect(NimBLEClient *c) override {
-    Serial.println("[MIDI-RT] TGT onConnect");
-  }
-  void onDisconnect(NimBLEClient *c, int reason) override {
+  void onConnect(NimBLEClient *) override { Serial.println("[MIDI-RT] TGT onConnect"); }
+  void onDisconnect(NimBLEClient *, int reason) override {
     Serial.printf("[MIDI-RT] TGT onDisconnect reason=%d (0x%02X)\n", reason, reason & 0xFF);
     g_tgtConn = false;
     g_tgtChar = nullptr;
@@ -327,8 +273,6 @@ class TgtCliCB : public NimBLEClientCallbacks {
 static SrcCliCB g_srcCliCB;
 static TgtCliCB g_tgtCliCB;
 
-static int g_failStreak = 0;
-
 static void fail(const char *msg) {
   ++g_failStreak;
   strncpy(g_failMsg, msg, sizeof(g_failMsg) - 1);
@@ -336,12 +280,10 @@ static void fail(const char *msg) {
   g_state = State::Failed;
 }
 
-static NimBLERemoteCharacteristic *g_srcChar = nullptr;   // held between connect & subscribe
-
-// Tear down ONE link and wait for it to actually go. deleteClient() on a still-
-// connected client only *starts* an async disconnect; reconnecting before the
-// client object is freed leaks a controller connection slot (only 3 exist) and
-// wedges the stack until a full power cycle.
+// Tear down ONE link and wait for it to actually go. deleteClient() on a
+// still-connected client only *starts* an async disconnect; reconnecting
+// before the client object is freed leaks a controller connection slot (only
+// 3 exist) and wedges the stack until a full power cycle.
 static void teardownLink(bool source) {
   if (source) { g_srcChar = nullptr; g_srcConn = false; }
   else        { g_tgtChar = nullptr; g_tgtConn = false; }
@@ -362,6 +304,14 @@ static void teardownLinks() {
   teardownLink(false);
 }
 
+static void configureRadio() {
+  NimBLEDevice::init(BLE_DEVICE_NAME);
+  NimBLEDevice::setPower(BLE_TX_POWER_DBM);
+  NimBLEDevice::setMTU(BLE_PREFERRED_MTU);
+  NimBLEDevice::setSecurityAuth(BLE_BOND, BLE_MITM, BLE_SECURE_CONNECTIONS);
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+}
+
 // Nuclear recovery: fully restart the BLE stack. Frees any leaked connection
 // slots on our side, and our disappearance lets the peers drop their stale
 // links via supervision timeout.
@@ -370,17 +320,13 @@ static void bleRestart() {
   teardownLinks();
   NimBLEDevice::deinit(true);
   delay(400);
-  NimBLEDevice::init("MIDI-Router");
-  NimBLEDevice::setPower(3);
-  NimBLEDevice::setMTU(128);
-  NimBLEDevice::setSecurityAuth(true, false, false);
-  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+  configureRadio();
   g_srcConn = g_tgtConn = false;
   g_srcChar = g_tgtChar = nullptr;
   g_failStreak = 0;
 }
 
-// connect + discover the MIDI characteristic. Does NOT subscribe (source).
+// Connect + discover the MIDI characteristic. Does NOT subscribe (source).
 static bool connectOne(bool source) {
   const uint64_t a = source ? g_srcAddr : g_tgtAddr;
   const uint8_t  t = source ? g_srcType : g_tgtType;
@@ -390,11 +336,11 @@ static bool connectOne(bool source) {
   cli->setClientCallbacks(source ? (NimBLEClientCallbacks *)&g_srcCliCB
                                  : (NimBLEClientCallbacks *)&g_tgtCliCB,
                           false);
-  cli->setConnectTimeout(8000);
-  // Fast interval from the first connection event: 7.5-15 ms, no slave latency,
-  // 4 s supervision timeout. Two hops at the ~30-50 ms default would stack to
-  // 60-100 ms; this keeps a hop near one interval.
-  cli->setConnectionParams(6, 12, 0, 400);
+  cli->setConnectTimeout(BLE_CONNECT_TIMEOUT_MS);
+  // Fast interval from the first connection event: two hops at NimBLE's
+  // ~30-50 ms default would stack to 60-100 ms of round-trip latency.
+  cli->setConnectionParams(BLE_CONN_INTERVAL_MIN, BLE_CONN_INTERVAL_MAX,
+                           BLE_CONN_LATENCY, BLE_CONN_TIMEOUT_10MS);
   if (!cli->connect(addr)) {
     NimBLEDevice::deleteClient(cli);
     return false;
@@ -435,8 +381,6 @@ static bool connectWithRetry(bool source, int tries) {
   return false;
 }
 
-static void drawStatus(const char *line1, const char *line2);
-
 static void doConnect() {
   g_linkLost = false;
   if (g_midiQ) xQueueReset(g_midiQ);
@@ -447,19 +391,17 @@ static void doConnect() {
 
   // Target first (idle radio); subscribing to Source starts the notify flood.
   if (!g_tgtConn) {
-    drawStatus("Connecting to", "TARGET ...");
+    display::showStatus("Connecting to", "TARGET ...");
     Serial.println("[MIDI-RT] connecting TARGET...");
-    if (!connectWithRetry(false, 4)) { fail("TARGET connect failed"); return; }
-    Serial.printf("[MIDI-RT] TARGET connected, MTU=%u\n",
-                  g_tgtCli ? g_tgtCli->getMTU() : 0);
+    if (!connectWithRetry(false, BLE_CONNECT_RETRIES)) { fail("TARGET connect failed"); return; }
+    Serial.printf("[MIDI-RT] TARGET connected, MTU=%u\n", g_tgtCli ? g_tgtCli->getMTU() : 0);
   }
 
   if (!g_srcConn) {
-    drawStatus("Connecting to", "SOURCE ...");
+    display::showStatus("Connecting to", "SOURCE ...");
     Serial.println("[MIDI-RT] connecting SOURCE...");
-    if (!connectWithRetry(true, 4)) { fail("SOURCE connect failed"); return; }
-    if (!g_srcChar || !g_srcChar->canNotify() ||
-        !g_srcChar->subscribe(true, onSrcNotify)) {
+    if (!connectWithRetry(true, BLE_CONNECT_RETRIES)) { fail("SOURCE connect failed"); return; }
+    if (!g_srcChar || !g_srcChar->canNotify() || !g_srcChar->subscribe(true, onSrcNotify)) {
       fail("SOURCE subscribe failed");
       return;
     }
@@ -473,180 +415,52 @@ static void doConnect() {
   g_state = State::Routing;
 }
 
-// ------------------------------ rendering ----------------------------
-static void titleBar(const char *txt, uint16_t bg) {
-  gfx->fillRect(0, 0, SCREEN_W, 18, bg);
-  gfx->setTextSize(1);
-  gfx->setTextColor(COL_TEXT);
-  gfx->setCursor(3, 6);
-  gfx->print(txt);
-}
-
-static void drawStatus(const char *line1, const char *line2) {
-  gfx->fillScreen(COL_BG);
-  titleBar("BLE MIDI ROUTER", COL_HDR);
-  gfx->setTextColor(COL_TEXT);
-  gfx->setTextSize(1);
-  gfx->setCursor(6, 60);
-  gfx->print(line1);
-  gfx->setCursor(6, 74);
-  gfx->print(line2);
-  gfx->flush();
-}
-
-static void drawScanList(bool pickingSource) {
-  gfx->fillScreen(COL_BG);
-  titleBar(pickingSource ? "Pick SOURCE" : "Pick TARGET", COL_HDR);
-
-  std::vector<Found> list;
+// ------------------------------- scan list -----------------------------
+// Snapshot g_found, filtering out the already-picked source when choosing
+// the target. Shared by drawing and picking so both see the same ordering.
+static std::vector<Found> snapshotFound(bool pickingSource) {
   portENTER_CRITICAL(&g_foundMux);
-  list = g_found;
+  std::vector<Found> list = g_found;
   portEXIT_CRITICAL(&g_foundMux);
-
-  // when picking target, don't offer the chosen source
   if (!pickingSource && g_srcSet) {
     list.erase(std::remove_if(list.begin(), list.end(),
                               [](const Found &f) { return f.addr == g_srcAddr; }),
                list.end());
   }
+  return list;
+}
 
-  gfx->setTextSize(1);
+static void drawScanList(bool pickingSource) {
+  std::vector<Found> list = snapshotFound(pickingSource);
+  const char *title = pickingSource ? "Pick SOURCE" : "Pick TARGET";
   if (list.empty()) {
-    gfx->setTextColor(COL_DIM);
-    gfx->setCursor(6, 40);
-    gfx->print("scanning for BLE-MIDI...");
-    gfx->flush();
+    display::showScanning(title);
     return;
   }
-
   if (g_cursor >= (int)list.size()) g_cursor = 0;
 
-  const int rowH = 28;
-  const int visible = (SCREEN_H - 22) / rowH;
-  int top = 0;
-  if (g_cursor >= visible) top = g_cursor - visible + 1;
-
-  int y = 22;
-  for (int i = top; i < (int)list.size() && i < top + visible; ++i) {
-    const Found &f = list[i];
-    if (i == g_cursor) gfx->fillRect(0, y - 2, SCREEN_W, rowH, COL_CURSOR);
-
-    NimBLEAddress a(f.addr, f.type);
-    gfx->setTextColor(COL_TEXT);
-    gfx->setCursor(4, y + 2);
-    std::string nm = f.name.empty() ? std::string("(unnamed)") : f.name;
-    if (nm.size() > 27) nm.resize(27);
-    gfx->print(nm.c_str());
-
-    gfx->setTextColor(i == g_cursor ? COL_TEXT : COL_DIM);
-    gfx->setCursor(4, y + 14);
-    gfx->printf("%s %ddBm", a.toString().c_str(), f.rssi);
-
-    gfx->drawFastHLine(0, y + rowH - 3, SCREEN_W, COL_SEP);
-    y += rowH;
-  }
-
-  gfx->setTextColor(COL_DIM);
-  gfx->setCursor(4, SCREEN_H - 10);
-  gfx->printf("%d found  short:next long:pick", (int)list.size());
-  gfx->flush();
+  std::vector<display::DeviceRow> rows;
+  rows.reserve(list.size());
+  for (auto &f : list)
+    rows.push_back({f.name, NimBLEAddress(f.addr, f.type).toString(), f.rssi});
+  display::showScanList(title, rows, g_cursor);
 }
 
 static void drawRouting() {
-  gfx->fillScreen(COL_BG);
-  const bool ok = g_srcConn && g_tgtConn;
-  titleBar(ok ? "ROUTING" : "LINK LOST", ok ? COL_HDR_OK : COL_BAD);
-
-  NimBLEAddress sa(g_srcAddr, g_srcType), ta(g_tgtAddr, g_tgtType);
-  gfx->setTextSize(1);
-
-  gfx->setTextColor(COL_TEXT);
-  gfx->setCursor(4, 26);
-  gfx->print("SRC");
-  gfx->setTextColor(g_srcConn ? COL_GOOD : COL_BAD);
-  gfx->setCursor(34, 26);
-  gfx->print(g_srcConn ? "connected" : "...");
-  gfx->setTextColor(COL_DIM);
-  gfx->setCursor(4, 40);
-  gfx->print(sa.toString().c_str());
-
-  gfx->setTextColor(COL_TEXT);
-  gfx->setCursor(80, 58);
-  gfx->print("|");
-  gfx->setCursor(80, 68);
-  gfx->print("v");
-
-  gfx->setTextColor(COL_TEXT);
-  gfx->setCursor(4, 84);
-  gfx->print("TGT");
-  gfx->setTextColor(g_tgtConn ? COL_GOOD : COL_BAD);
-  gfx->setCursor(34, 84);
-  gfx->print(g_tgtConn ? "connected" : "...");
-  gfx->setTextColor(COL_DIM);
-  gfx->setCursor(4, 98);
-  gfx->print(ta.toString().c_str());
-
-  gfx->drawFastHLine(0, 116, SCREEN_W, COL_SEP);
-
-  gfx->setTextColor(COL_TEXT);
-  gfx->setCursor(4, 126);
-  gfx->printf("rx  : %lu", (unsigned long)g_rxCount);
-  gfx->setCursor(4, 140);
-  gfx->printf("fwd : %lu", (unsigned long)g_fwdCount);
-#if CC2PB_ENABLE
-  gfx->setCursor(90, 126);
-  gfx->printf("cc%d>pb", CC2PB_CC);
-  gfx->setCursor(90, 140);
-  gfx->printf("%lu @%u%%", (unsigned long)g_xformCount, (unsigned)CC2PB_RANGE_PCT);
-  gfx->setTextColor(COL_GOOD);
-  gfx->setCursor(90, 154);
-  gfx->printf("xpose %+d", g_transpose);
-#endif
-  if (g_dropCount) {
-    gfx->setTextColor(COL_BAD);
-    gfx->setCursor(4, 154);
-    gfx->printf("drop: %lu", (unsigned long)g_dropCount);
-  }
-
-  gfx->setTextColor(COL_DIM);
-  gfx->setCursor(4, 172);
-  gfx->print("last:");
-  gfx->setTextColor(COL_TEXT);
-  gfx->setCursor(34, 172);
-  if (g_lastMsgLen) {
-    char hex[3 * 8 + 1];
-    int o = 0;
-    for (int i = 0; i < g_lastMsgLen; ++i)
-      o += snprintf(hex + o, sizeof(hex) - o, "%02X ", g_lastMsg[i]);
-    gfx->print(hex);
-    gfx->setTextColor(COL_DIM);
-    gfx->setCursor(34, 186);
-    gfx->printf("%lus ago", (unsigned long)((millis() - g_lastMsgAt) / 1000));
-  } else {
-    gfx->print("--");
-  }
-
-  gfx->setTextColor(COL_DIM);
-  gfx->setCursor(4, SCREEN_H - 22);
-  gfx->print("short: transpose 0/+12/-12");
-  gfx->setCursor(4, SCREEN_H - 10);
-  gfx->print("long : forget + rescan");
-  gfx->flush();
-}
-
-static void drawFailed() {
-  gfx->fillScreen(COL_BG);
-  titleBar("ERROR", COL_BAD);
-  gfx->setTextSize(1);
-  gfx->setTextColor(COL_TEXT);
-  gfx->setCursor(6, 50);
-  gfx->print(g_failMsg);
-  gfx->setTextColor(COL_DIM);
-  gfx->setCursor(6, 80);
-  gfx->print("short: retry");
-  gfx->setCursor(6, 94);
-  gfx->print("long : forget + rescan");
-  gfx->flush();
+  display::RoutingView v;
+  v.srcConnected = g_srcConn;
+  v.tgtConnected = g_tgtConn;
+  v.srcAddress   = NimBLEAddress(g_srcAddr, g_srcType).toString();
+  v.tgtAddress   = NimBLEAddress(g_tgtAddr, g_tgtType).toString();
+  v.rx = g_rxCount;
+  v.fwd = g_fwdCount;
+  v.drop = g_dropCount;
+  v.transpose = transpose::get();
+  v.cc2pbHits = g_xformCount;
+  v.lastMessage = g_lastMsg;
+  v.lastMessageLen = g_lastMsgLen;
+  v.lastMessageAgeMs = millis() - g_lastMsgAt;
+  display::showRouting(v);
 }
 
 // ------------------------------- button ------------------------------
@@ -654,7 +468,7 @@ enum class Press { None, Short, Long };
 static Press pollButton() {
   static bool wasDown = false;
   static uint32_t downAt = 0;
-  const bool down = digitalRead(BOARD->btn) == LOW;
+  const bool down = digitalRead(g_board->button) == LOW;
   const uint32_t now = millis();
   Press p = Press::None;
   if (down && !wasDown) {
@@ -679,20 +493,22 @@ static int scanListSize(bool pickingSource) {
   return n;
 }
 
-// pick the cursor-th entry from the same filtered/ordered list drawScanList uses
+// Pick the cursor-th entry from the same filtered/ordered list drawScanList uses.
 static bool pickAt(bool pickingSource, int idx, uint64_t &addr, uint8_t &type) {
-  portENTER_CRITICAL(&g_foundMux);
-  std::vector<Found> list = g_found;
-  portEXIT_CRITICAL(&g_foundMux);
-  if (!pickingSource && g_srcSet) {
-    list.erase(std::remove_if(list.begin(), list.end(),
-                              [](const Found &f) { return f.addr == g_srcAddr; }),
-               list.end());
-  }
+  std::vector<Found> list = snapshotFound(pickingSource);
   if (idx < 0 || idx >= (int)list.size()) return false;
   addr = list[idx].addr;
   type = list[idx].type;
   return true;
+}
+
+static void resetForRescan() {
+  teardownLinks();
+  forgetPair();
+  g_found.clear();
+  g_cursor = 0;
+  startScan();
+  g_state = State::ScanSource;
 }
 
 // -------------------------------- setup ------------------------------
@@ -701,37 +517,17 @@ void setup() {
   delay(200);
   Serial.println("\n[MIDI-RT] boot");
 
-  BOARD = detectBoard();
-  Serial.printf("[MIDI-RT] board: %s\n", BOARD->name);
+  g_board = &detectBoard();
+  Serial.printf("[MIDI-RT] board: %s\n", g_board->name);
+  pinMode(g_board->button, INPUT_PULLUP);
 
-  pinMode(BOARD->btn, INPUT_PULLUP);
-  pinMode(BOARD->bl, OUTPUT);
-  digitalWrite(BOARD->bl, HIGH);
+  display::init(*g_board);
+  configureRadio();
 
-  bus = new Arduino_ESP32SPI(BOARD->dc, BOARD->cs, BOARD->sck, BOARD->mosi,
-                             GFX_NOT_DEFINED);
-  panel = new Arduino_ST7789(bus, BOARD->rst, ROTATION, true, SCREEN_W, SCREEN_H,
-                             34, 0, 34, 0);
-#if USE_CANVAS
-  gfx = new Arduino_Canvas(SCREEN_W, SCREEN_H, panel);
-#else
-  gfx = panel;
-#endif
-  if (!gfx->begin()) Serial.println("[MIDI-RT] gfx->begin() failed");
-  gfx->fillScreen(COL_BG);
-
-  NimBLEDevice::init("MIDI-Router");
-  NimBLEDevice::setPower(3 /* dBm */);
-  NimBLEDevice::setMTU(128);
-  // The BLE-MIDI characteristic requires an encrypted link on many devices.
-  // Bond, no MITM, "Just Works" pairing so it happens without user input.
-  NimBLEDevice::setSecurityAuth(true, false, false);
-  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
-
-  g_midiQ = xQueueCreate(64, sizeof(RawFrame));
+  g_midiQ = xQueueCreate(MIDI_QUEUE_DEPTH, sizeof(RawFrame));
   xTaskCreate(midiPumpTask, "midiPump", 8192, nullptr, 6, &g_pumpTask);
 
-  const bool held = digitalRead(BOARD->btn) == LOW;
+  const bool held = digitalRead(g_board->button) == LOW;
   if (loadPair() && !held) {
     Serial.println("[MIDI-RT] stored pair found -> connecting");
     g_state = State::Connecting;
@@ -761,12 +557,10 @@ void loop() {
             g_srcAddr = a; g_srcType = t; g_srcSet = true;
             g_cursor = 0;
             g_state = State::ScanTarget;
-            Serial.printf("[MIDI-RT] source = %s\n",
-                          NimBLEAddress(a, t).toString().c_str());
+            Serial.printf("[MIDI-RT] source = %s\n", NimBLEAddress(a, t).toString().c_str());
           } else {
             g_tgtAddr = a; g_tgtType = t; g_tgtSet = true;
-            Serial.printf("[MIDI-RT] target = %s\n",
-                          NimBLEAddress(a, t).toString().c_str());
+            Serial.printf("[MIDI-RT] target = %s\n", NimBLEAddress(a, t).toString().c_str());
             stopScan();
             savePair();
             g_state = State::Connecting;
@@ -791,23 +585,17 @@ void loop() {
       }
       static uint32_t lastDraw = 0;
       if (btn == Press::Short) {
-        // cycle transpose 0 -> +12 -> -12 and persist it
-        size_t n = sizeof(TRANSPOSE_STEPS) / sizeof(TRANSPOSE_STEPS[0]);
-        size_t idx = 0;
-        for (size_t k = 0; k < n; ++k)
-          if (TRANSPOSE_STEPS[k] == g_transpose) { idx = k; break; }
-        g_transpose = TRANSPOSE_STEPS[(idx + 1) % n];
+#if ENABLE_TRANSPOSE
+        transpose::cycle();
         saveTranspose();
         enqueuePanic();   // clear notes held across the change
-        Serial.printf("[MIDI-RT] transpose = %+d (panic sent)\n", g_transpose);
+        Serial.printf("[MIDI-RT] transpose = %+d (panic sent)\n", transpose::get());
+#else
+        g_rxCount = g_fwdCount = g_dropCount = g_xformCount = 0;
+#endif
         lastDraw = 0;   // redraw immediately
       } else if (btn == Press::Long) {
-        teardownLinks();
-        forgetPair();
-        g_found.clear();
-        g_cursor = 0;
-        startScan();
-        g_state = State::ScanSource;
+        resetForRescan();
         break;
       }
       static uint32_t lastHb = 0;
@@ -815,18 +603,18 @@ void loop() {
       if (millis() - lastHb > 2000) {
         lastHb = millis();
         if (g_fwdCount != lastFwd) {
-          Serial.printf("[MIDI-RT] rx=%lu fwd=%lu drop=%lu cc2pb=%lu xpose=%+d last=",
+          Serial.printf("[MIDI-RT] rx=%lu fwd=%lu drop=%lu xform=%lu xpose=%+d last=",
                         (unsigned long)g_rxCount, (unsigned long)g_fwdCount,
                         (unsigned long)g_dropCount, (unsigned long)g_xformCount,
-                        g_transpose);
+                        transpose::get());
           for (int i = 0; i < g_lastMsgLen; ++i) Serial.printf("%02X ", g_lastMsg[i]);
           Serial.println();
           lastFwd = g_fwdCount;
         }
       }
-      // routing screen is status-only; 1 Hz redraw keeps the SPI bus (and the
-      // radio) free for MIDI forwarding
-      if (millis() - lastDraw >= 1000) {
+      // routing screen is status-only; a slow redraw keeps the SPI bus (and
+      // the radio) free for MIDI forwarding
+      if (millis() - lastDraw >= DISPLAY_REDRAW_MS) {
         drawRouting();
         lastDraw = millis();
       }
@@ -843,19 +631,14 @@ void loop() {
         g_state = State::Connecting;
       } else if (btn == Press::Long) {
         failedAt = 0;
-        teardownLinks();
-        forgetPair();
-        g_found.clear();
-        g_cursor = 0;
-        startScan();
-        g_state = State::ScanSource;
+        resetForRescan();
       } else if (millis() - failedAt > 4000) {
         failedAt = 0;
-        if (g_failStreak >= 3) bleRestart();   // stuck: restart the BLE stack
+        if (g_failStreak >= BLE_RECONNECT_FAIL_STREAK_FOR_RESTART) bleRestart();
         Serial.println("[MIDI-RT] auto-retry after failure");
         g_state = State::Connecting;
       } else {
-        drawFailed();
+        display::showError(g_failMsg);
         delay(80);
       }
       break;

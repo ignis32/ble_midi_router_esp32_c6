@@ -15,6 +15,30 @@ Probes the I2C bus (GPIO18/19) for the touch controller / IMU and picks pins:
 | BOOT button | GPIO9 | GPIO8 |
 | Flash | 4 MB | 8 MB |
 
+## Project layout
+
+```
+src/
+  main.cpp                    app: BLE-central connection management + screen
+                               state machine. Doesn't render or know board pins.
+  config.h                    every tunable setting — start here
+  board.h / board.cpp         the two board pin tables + auto-detect
+  display.h / display.cpp     all screens; owns the GFX objects
+  blemidi.h / blemidi.cpp     BLE-MIDI GATT UUIDs + a packet walker shared by
+                               the transform modules
+  transforms/
+    transform_chain.h/.cpp    single entry point main.cpp calls; doesn't know
+                               which transforms exist
+    transpose.h/.cpp          general-purpose note transpose
+    cc_to_pitchbend.h/.cpp    personal example — see below
+```
+
+Adding your own transform: write a module with the `transpose.*` /
+`cc_to_pitchbend.*` pattern (an `apply(uint8_t *packet, uint16_t len)` that
+uses `blemidi::forEachMessage()` to visit each message) and call it from
+`transform_chain.cpp`. It never needs to know about BLE, the connection state,
+or the other transforms.
+
 ## How it works
 
 - **Topology:** the board is a BLE **central to both** devices, so Source and
@@ -25,44 +49,56 @@ Probes the I2C bus (GPIO18/19) for the touch controller / IMU and picks pins:
   `03B80E5A-EDE8-4B33-A751-6CE34EC4C700`.
 - **Pairing:** the MIDI characteristic usually needs an encrypted link. The
   router bonds automatically with "Just Works" pairing (no PIN).
-- **Forwarding — raw passthrough (`RAW_PASSTHROUGH 1`):** each Source
-  notification payload is copied to the Target characteristic **verbatim**
-  (write-without-response), one write per packet. No MIDI parsing, so nothing
-  can be fabricated, dropped-by-misparse, or reordered. A BLE-MIDI packet is
+- **Forwarding — raw passthrough:** each Source notification payload is copied
+  to the Target characteristic **verbatim** (write-without-response), one
+  write per packet. No MIDI parsing in the forwarding path itself, so nothing
+  can be fabricated, dropped-by-misparse, or reordered — a BLE-MIDI packet is
   self-contained, so for a 1:1 router this is both simplest and safest.
-  `blemidi.h` (parser + re-encoder) is retained, unused, for a future
-  filter / merge / channel-remap mode.
-- **CC -> Pitch Bend (`src/transform.h`, `CC2PB_ENABLE 1`):** Control Change
-  `#CC2PB_CC` (default 52 — rotation on an Artinoise Re.corder) is rewritten
-  **in place** to a Pitch Bend on the same channel before the write. CC and
-  Pitch Bend are both 3-byte messages, so the packet is otherwise untouched.
-  Curve: dead zone of `CC2PB_DEADZONE` either side of 64 -> bend centre; past
-  it the bend ramps from centre (no jump). Depth is `CC2PB_RANGE_PCT` % of the
-  full 14-bit range at the CC extremes (audible width = that x the synth's own
-  bend range). Resolution is 7-bit (~62 steps/side) — slow sweeps can step;
-  slew/interpolation is a TODO.
-- **Transpose (`src/transform.h`):** Note Off / Note On / Poly Aftertouch note
-  numbers are shifted by `g_transpose` semitones (clamped 0..127) in the same
-  in-place pass. Short BOOT press on the ROUTING screen cycles 0 / +12 / -12,
-  persisted to NVS.
 - **Pipeline:** the notify callback (BLE host task) only copies the payload
-  into a fixed-size FreeRTOS queue; a separate pump task does the writes with
-  ENOMEM backoff. Writing unpaced from the callback exhausts the mbuf pool and
-  drops the link.
-- **Latency:** `setConnectionParams(6, 12, 0, 400)` before connecting asks both
-  links for a 7.5-15 ms interval. Keep `LOG_RAW 0` — per-message serial logging
-  on the hot path adds perceptible latency.
-- **Connect order:** Target first (idle radio), then Source; subscribing to the
-  Source starts the notification stream. Each connect retries 3x; the ERROR
-  screen auto-retries every 4 s.
-- **Persistence:** the chosen pair is stored in NVS and reconnected on boot.
+  into a fixed-size FreeRTOS queue; a separate pump task runs the transform
+  chain and does the writes with ENOMEM backoff. Writing unpaced from the
+  callback exhausts the mbuf pool and drops the link.
+- **Reconnect:** on either side dropping, only that side is torn down (with a
+  wait for the client object to actually free — `deleteClient()` on a live
+  client is async) and reconnected; the healthy link is left alone. After
+  `BLE_RECONNECT_FAIL_STREAK_FOR_RESTART` consecutive failures the whole BLE
+  stack restarts, which clears any leaked connection slots and lets a peer
+  that still thinks it's connected time out and drop the stale link.
+- **Latency:** a fast connection interval (7.5–15 ms) is requested on both
+  links — two default-interval hops would otherwise stack to 60–100 ms of
+  round-trip. Keep `DEBUG_LOG_TRANSFORMS` off — per-packet serial logging on
+  the hot path adds perceptible latency; it's for diagnosing a transform.
+- **Connect order:** Target first (idle radio), then Source; subscribing to
+  the Source starts the notification stream.
+- **Persistence:** the chosen pair (and transpose) is stored in NVS and
+  reconnected on boot.
+
+### MIDI transforms (`config.h`, `src/transforms/`)
+
+Both run as an in-place rewrite in the pump task, just before the write —
+`len` never changes, so this is layered cleanly on top of raw passthrough.
+
+- **Transpose** (`ENABLE_TRANSPOSE`, on by default) — Note Off / Note On /
+  Poly Aftertouch note numbers shifted by a configurable number of semitones
+  (clamped 0..127). General-purpose, safe with any controller/synth pair.
+  Short BOOT press on the ROUTING screen cycles through `TRANSPOSE_STEPS`
+  (default −12 / −7 / 0 / +7 / +12, ascending, wraps), persisted to NVS, and
+  sends an All Notes Off + All Sound Off burst so a note held across the
+  switch can't hang.
+- **CC → Pitch Bend** (`ENABLE_CC_TO_PITCHBEND`, **off by default**) —
+  converts one Control Change controller to Pitch Bend on the same channel,
+  with a dead zone around its centre and a configurable depth. This is a
+  **personal mapping** written for the Artinoise Re.corder BLE flute's
+  "rotation" CC (centred on 64) — the CC number and curve are specific to
+  that controller. Treat `cc_to_pitchbend.*` as a template for your own
+  controller, not something to enable blind.
 
 ## Controls (BOOT button)
 
 | Screen | Short press | Long press (>0.6 s) |
 |---|---|---|
 | Pick SOURCE / TARGET | move cursor | select highlighted device |
-| ROUTING | cycle transpose 0 / +12 / -12 semitones (saved to NVS) | forget pair + rescan |
+| ROUTING | cycle transpose (if enabled), else reset counters | forget pair + rescan |
 | ERROR | retry connect | forget pair + rescan |
 
 Hold BOOT **while powering on** to skip the stored pair and rescan.
@@ -72,8 +108,9 @@ Hold BOOT **while powering on** to skip the stored pair and rescan.
 - **Pick SOURCE / TARGET** — live list of BLE-MIDI devices (name, address, RSSI),
   highlighted cursor row.
 - **ROUTING** — Source ▸ Target, per-side connection state, `rx` (packets in) /
-  `fwd` (packets out) / `drop` counters, and the last MIDI message in hex.
-  Header turns red and says `LINK LOST` if either side drops (auto-reconnects).
+  `fwd` (packets out) / `drop` counters, transform stats, and the last MIDI
+  message in hex. Header turns red and says `LINK LOST` if either side drops
+  (auto-reconnects).
 
 ## Toolchain
 
@@ -96,8 +133,9 @@ pio device monitor
   (phone / laptop / privacy-enabled device) won't reconnect after it rotates —
   hold BOOT at power-on to rescan and re-pick. TODO: store the name and
   reconnect by name-match.
-- One MIDI stream, one direction. No merge, filtering, or channel remap (that's
-  what the retained `blemidi.h` parser is for).
-- Teardown vs. in-flight notify has a small race window on disconnect.
-- No active-note tracking / panic. If the Source link itself drops a Note Off
-  notification (RF), that note can hang until the next Note On for it.
+- One MIDI stream, one direction. No merge, filtering, or channel remap beyond
+  the two transforms in `src/transforms/` — add more following the same
+  pattern.
+- No active-note tracking / panic against a dropped notification. If the
+  Source *link itself* loses a Note Off to RF (not a transpose change, which
+  is already covered), that note can hang until the next Note On for it.
