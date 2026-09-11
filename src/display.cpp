@@ -25,7 +25,7 @@ void titleBar(const char *txt, uint16_t bg) {
   gfx_->fillRect(0, 0, DISPLAY_WIDTH, 18, bg);
   gfx_->setTextSize(1);
   gfx_->setTextColor(COL_TEXT);
-  gfx_->setCursor(9, 6);   // panel's rounded corners clip a title starting at x=3
+  gfx_->setCursor(15, 6);   // panel's rounded corners clip a title starting closer to the edge
   gfx_->print(txt);
 }
 
