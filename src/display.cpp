@@ -76,7 +76,8 @@ void showScanning(const char *title) {
   gfx_->flush();
 }
 
-void showScanList(const char *title, const std::vector<DeviceRow> &rows, int cursor) {
+void showScanList(const char *title, const std::vector<DeviceRow> &rows, int cursor,
+                  bool confirming) {
   gfx_->fillScreen(COL_BG);
   titleBar(title, COL_HDR);
   gfx_->setTextSize(1);
@@ -89,7 +90,11 @@ void showScanList(const char *title, const std::vector<DeviceRow> &rows, int cur
   int y = 22;
   for (int i = top; i < (int)rows.size() && i < top + visible; ++i) {
     const DeviceRow &r = rows[i];
-    if (i == cursor) gfx_->fillRect(0, y - 2, DISPLAY_WIDTH, rowH, COL_CURSOR);
+    const bool isCursor = i == cursor;
+    if (isCursor) {
+      gfx_->fillRect(0, y - 2, DISPLAY_WIDTH, rowH, confirming ? COL_GOOD : COL_CURSOR);
+      if (confirming) gfx_->drawRect(1, y - 1, DISPLAY_WIDTH - 2, rowH - 3, COL_TEXT);
+    }
 
     gfx_->setTextColor(COL_TEXT);
     gfx_->setCursor(4, y + 2);
@@ -97,7 +102,7 @@ void showScanList(const char *title, const std::vector<DeviceRow> &rows, int cur
     if (nm.size() > 27) nm.resize(27);
     gfx_->print(nm.c_str());
 
-    gfx_->setTextColor(i == cursor ? COL_TEXT : COL_DIM);
+    gfx_->setTextColor(isCursor ? COL_TEXT : COL_DIM);
     gfx_->setCursor(4, y + 14);
     gfx_->printf("%s %ddBm", r.address.c_str(), r.rssi);
 
@@ -105,9 +110,14 @@ void showScanList(const char *title, const std::vector<DeviceRow> &rows, int cur
     y += rowH;
   }
 
-  gfx_->setTextColor(COL_DIM);
   gfx_->setCursor(4, DISPLAY_HEIGHT - 10);
-  gfx_->printf("%d found  short:next long:pick", (int)rows.size());
+  if (confirming) {
+    gfx_->setTextColor(COL_GOOD);
+    gfx_->print("release to select");
+  } else {
+    gfx_->setTextColor(COL_DIM);
+    gfx_->printf("%d found  short:next long:pick", (int)rows.size());
+  }
   gfx_->flush();
 }
 

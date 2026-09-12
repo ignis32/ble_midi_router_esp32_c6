@@ -30,7 +30,11 @@ void init(const BoardProfile &board);
 
 void showStatus(const char *line1, const char *line2, const char *hint = nullptr);
 void showScanning(const char *title);
-void showScanList(const char *title, const std::vector<DeviceRow> &rows, int cursor);
+// `confirming` frames the cursor row and swaps the footer hint once BOOT has
+// been held past the long-press threshold, so it's visible before release
+// whether holding long enough has registered.
+void showScanList(const char *title, const std::vector<DeviceRow> &rows, int cursor,
+                  bool confirming);
 void showRouting(const RoutingView &view);
 void showError(const char *message);
 

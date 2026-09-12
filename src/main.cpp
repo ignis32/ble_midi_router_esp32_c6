@@ -477,7 +477,7 @@ static void drawScanList(bool pickingSource) {
   rows.reserve(list.size());
   for (auto &f : list)
     rows.push_back({f.name, NimBLEAddress(f.addr, f.type).toString(), f.rssi});
-  display::showScanList(title, rows, g_cursor);
+  display::showScanList(title, rows, g_cursor, longPressHeld());
 }
 
 static void drawRouting() {
