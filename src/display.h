@@ -35,7 +35,10 @@ void showScanning(const char *title);
 // whether holding long enough has registered.
 void showScanList(const char *title, const std::vector<DeviceRow> &rows, int cursor,
                   bool confirming);
-void showRouting(const RoutingView &view);
-void showError(const char *message);
+// `confirming` swaps the bottom hint for a bright "release to ..." banner
+// once BOOT has been held past the long-press threshold (same idea as
+// showScanList's cursor-row highlight).
+void showRouting(const RoutingView &view, bool confirming);
+void showError(const char *message, bool confirming);
 
 }  // namespace display

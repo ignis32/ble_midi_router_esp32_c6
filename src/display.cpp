@@ -29,6 +29,18 @@ void titleBar(const char *txt, uint16_t bg) {
   gfx_->print(txt);
 }
 
+// Replaces a screen's static bottom hint with a bright, unmissable banner
+// once a long press has registered but before the button is released --
+// same idea as the picker's cursor-row highlight.
+void drawConfirmFooter(const char *action) {
+  gfx_->fillRect(0, DISPLAY_HEIGHT - 24, DISPLAY_WIDTH, 24, COL_GOOD);
+  gfx_->setTextColor(COL_BG);
+  gfx_->setCursor(4, DISPLAY_HEIGHT - 20);
+  gfx_->print("release to");
+  gfx_->setCursor(4, DISPLAY_HEIGHT - 9);
+  gfx_->print(action);
+}
+
 }  // namespace
 
 void init(const BoardProfile &board) {
@@ -121,7 +133,7 @@ void showScanList(const char *title, const std::vector<DeviceRow> &rows, int cur
   gfx_->flush();
 }
 
-void showRouting(const RoutingView &v) {
+void showRouting(const RoutingView &v, bool confirming) {
   gfx_->fillScreen(COL_BG);
   const bool ok = v.srcConnected && v.tgtConnected;
   titleBar(ok ? "ROUTING" : "LINK LOST", ok ? COL_HDR_OK : COL_BAD);
@@ -195,30 +207,38 @@ void showRouting(const RoutingView &v) {
     gfx_->print("--");
   }
 
-  gfx_->setTextColor(COL_DIM);
-  gfx_->setCursor(4, DISPLAY_HEIGHT - 22);
+  if (confirming) {
+    drawConfirmFooter("forget + rescan");
+  } else {
+    gfx_->setTextColor(COL_DIM);
+    gfx_->setCursor(4, DISPLAY_HEIGHT - 22);
 #if ENABLE_TRANSPOSE
-  gfx_->print("short: cycle transpose");
+    gfx_->print("short: cycle transpose");
 #else
-  gfx_->print("short: reset counters");
+    gfx_->print("short: reset counters");
 #endif
-  gfx_->setCursor(4, DISPLAY_HEIGHT - 10);
-  gfx_->print("long : forget + rescan");
+    gfx_->setCursor(4, DISPLAY_HEIGHT - 10);
+    gfx_->print("long : forget + rescan");
+  }
   gfx_->flush();
 }
 
-void showError(const char *message) {
+void showError(const char *message, bool confirming) {
   gfx_->fillScreen(COL_BG);
   titleBar("ERROR", COL_BAD);
   gfx_->setTextSize(1);
   gfx_->setTextColor(COL_TEXT);
   gfx_->setCursor(6, 50);
   gfx_->print(message);
-  gfx_->setTextColor(COL_DIM);
-  gfx_->setCursor(6, 80);
-  gfx_->print("short: retry");
-  gfx_->setCursor(6, 94);
-  gfx_->print("long : forget + rescan");
+  if (confirming) {
+    drawConfirmFooter("forget + rescan");
+  } else {
+    gfx_->setTextColor(COL_DIM);
+    gfx_->setCursor(6, 80);
+    gfx_->print("short: retry");
+    gfx_->setCursor(6, 94);
+    gfx_->print("long : forget + rescan");
+  }
   gfx_->flush();
 }
 

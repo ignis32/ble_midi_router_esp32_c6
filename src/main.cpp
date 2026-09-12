@@ -494,7 +494,7 @@ static void drawRouting() {
   v.lastMessage = g_lastMsg;
   v.lastMessageLen = g_lastMsgLen;
   v.lastMessageAgeMs = millis() - g_lastMsgAt;
-  display::showRouting(v);
+  display::showRouting(v, longPressHeld());
 }
 
 // ------------------------------- button ------------------------------
@@ -671,8 +671,11 @@ void loop() {
         }
       }
       // routing screen is status-only; a slow redraw keeps the SPI bus (and
-      // the radio) free for MIDI forwarding
-      if (millis() - lastDraw >= DISPLAY_REDRAW_MS) {
+      // the radio) free for MIDI forwarding -- except while a long press is
+      // building up, where the "release to forget" banner needs to appear
+      // promptly rather than after up to a full second of lag
+      const uint32_t redrawMs = longPressHeld() ? 60 : DISPLAY_REDRAW_MS;
+      if (millis() - lastDraw >= redrawMs) {
         drawRouting();
         lastDraw = millis();
       }
@@ -696,7 +699,7 @@ void loop() {
         Serial.println("[MIDI-RT] auto-retry after failure");
         g_state = State::Connecting;
       } else {
-        display::showError(g_failMsg);
+        display::showError(g_failMsg, longPressHeld());
         delay(80);
       }
       break;
