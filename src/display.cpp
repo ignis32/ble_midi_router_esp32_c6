@@ -58,6 +58,9 @@ void showStatus(const char *line1, const char *line2) {
   gfx_->print(line1);
   gfx_->setCursor(6, 74);
   gfx_->print(line2);
+  gfx_->setTextColor(COL_DIM);
+  gfx_->setCursor(6, DISPLAY_HEIGHT - 10);
+  gfx_->print("hold BOOT: cancel");
   gfx_->flush();
 }
 

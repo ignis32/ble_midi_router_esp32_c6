@@ -326,6 +326,24 @@ static void bleRestart() {
   g_failStreak = 0;
 }
 
+static constexpr uint32_t LONG_PRESS_MS = 600;
+
+// True once BOOT has been held continuously past the long-press threshold.
+// Unlike pollButton() (which only reports a press once it's released), this
+// can be polled from inside a blocking connect attempt to react to a held
+// button right away instead of waiting for every retry to exhaust first --
+// a single cli->connect() below can itself block up to BLE_CONNECT_TIMEOUT_MS
+// and isn't interruptible, so this is checked between attempts.
+static bool longPressHeld() {
+  static uint32_t downSince = 0;
+  if (digitalRead(g_board->button) != LOW) { downSince = 0; return false; }
+  if (downSince == 0) downSince = millis();
+  return millis() - downSince > LONG_PRESS_MS;
+}
+
+static volatile bool g_connectAborted = false;   // set by connectWithRetry() on a held BOOT
+static void resetForRescan();                    // defined below, used by doConnect()
+
 // Connect + discover the MIDI characteristic. Does NOT subscribe (source).
 static bool connectOne(bool source) {
   const uint64_t a = source ? g_srcAddr : g_tgtAddr;
@@ -369,20 +387,28 @@ static bool connectOne(bool source) {
 static bool connectWithRetry(bool source, int tries) {
   const size_t keep = source && g_tgtConn ? 1 : (!source && g_srcConn ? 1 : 0);
   for (int i = 1; i <= tries; ++i) {
+    if (longPressHeld()) { g_connectAborted = true; return false; }
     if (connectOne(source)) return true;
     Serial.printf("[MIDI-RT] %s connect attempt %d/%d failed\n",
                   source ? "SRC" : "TGT", i, tries);
-    // let the failed/cancelled client object be freed before the next try
+    // let the failed/cancelled client object be freed before the next try,
+    // checking every tick so a held BOOT cancels immediately
     const uint32_t t0 = millis();
-    while (NimBLEDevice::getCreatedClientCount() > keep && millis() - t0 < 1500)
+    while (NimBLEDevice::getCreatedClientCount() > keep && millis() - t0 < 1500) {
+      if (longPressHeld()) { g_connectAborted = true; return false; }
       delay(20);
-    vTaskDelay(pdMS_TO_TICKS(800));
+    }
+    for (uint32_t waited = 0; waited < 800; waited += 20) {
+      if (longPressHeld()) { g_connectAborted = true; return false; }
+      vTaskDelay(pdMS_TO_TICKS(20));
+    }
   }
   return false;
 }
 
 static void doConnect() {
   g_linkLost = false;
+  g_connectAborted = false;
   if (g_midiQ) xQueueReset(g_midiQ);
 
   // Drop only the dead side(s); a healthy link stays up and is left alone.
@@ -393,14 +419,22 @@ static void doConnect() {
   if (!g_tgtConn) {
     display::showStatus("Connecting to", "TARGET ...");
     Serial.println("[MIDI-RT] connecting TARGET...");
-    if (!connectWithRetry(false, BLE_CONNECT_RETRIES)) { fail("TARGET connect failed"); return; }
+    if (!connectWithRetry(false, BLE_CONNECT_RETRIES)) {
+      if (g_connectAborted) { Serial.println("[MIDI-RT] connect cancelled (BOOT held)"); resetForRescan(); return; }
+      fail("TARGET connect failed");
+      return;
+    }
     Serial.printf("[MIDI-RT] TARGET connected, MTU=%u\n", g_tgtCli ? g_tgtCli->getMTU() : 0);
   }
 
   if (!g_srcConn) {
     display::showStatus("Connecting to", "SOURCE ...");
     Serial.println("[MIDI-RT] connecting SOURCE...");
-    if (!connectWithRetry(true, BLE_CONNECT_RETRIES)) { fail("SOURCE connect failed"); return; }
+    if (!connectWithRetry(true, BLE_CONNECT_RETRIES)) {
+      if (g_connectAborted) { Serial.println("[MIDI-RT] connect cancelled (BOOT held)"); resetForRescan(); return; }
+      fail("SOURCE connect failed");
+      return;
+    }
     if (!g_srcChar || !g_srcChar->canNotify() || !g_srcChar->subscribe(true, onSrcNotify)) {
       fail("SOURCE subscribe failed");
       return;
@@ -477,7 +511,7 @@ static Press pollButton() {
   } else if (!down && wasDown) {
     wasDown = false;
     const uint32_t held = now - downAt;
-    if (held >= 30) p = held > 600 ? Press::Long : Press::Short;
+    if (held >= 30) p = held > LONG_PRESS_MS ? Press::Long : Press::Short;
   }
   return p;
 }
