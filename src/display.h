@@ -28,7 +28,7 @@ struct RoutingView {
 
 void init(const BoardProfile &board);
 
-void showStatus(const char *line1, const char *line2);
+void showStatus(const char *line1, const char *line2, const char *hint = nullptr);
 void showScanning(const char *title);
 void showScanList(const char *title, const std::vector<DeviceRow> &rows, int cursor);
 void showRouting(const RoutingView &view);

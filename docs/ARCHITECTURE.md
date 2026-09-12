@@ -107,10 +107,24 @@ Both run as an in-place rewrite in the pump task, just before the write —
 | Screen | Short press | Long press (>0.6 s) |
 |---|---|---|
 | Pick SOURCE / TARGET | move cursor | select highlighted device |
+| CONNECTING | — | cancel and rescan (reacts within one connect timeout, not instantly — see below) |
 | ROUTING | cycle transpose (if enabled), else reset counters | forget pair + rescan |
 | ERROR | retry connect | forget pair + rescan |
 
-Hold BOOT **while powering on** to skip the stored pair and rescan.
+**At boot**, if a pair is stored, the screen shows "Hold BOOT now to forget
+saved pair" for ~1.5 s; pressing BOOT during that window forgets it and goes
+to Pick SOURCE instead of reconnecting.
+
+**Do not hold BOOT in while power-cycling or resetting the board.** On
+ESP32-C6 (and C3), the BOOT-button pin doubles as the chip's UART-download
+strapping pin — the ROM samples it at reset and, if it's low, boots straight
+into the flashing bootloader instead of running this firmware at all (black
+screen, no serial output, `setup()` never runs). This is exactly why a
+"hold BOOT at power-on" gesture *can't* be implemented by reading the pin
+early in `setup()` — if that condition had actually been true, the app
+wouldn't be executing to check it. The 1.5 s window above only works because
+it happens once the app is already running, well past the point the ROM
+makes that decision.
 
 ## Screens
 
@@ -140,8 +154,8 @@ pio device monitor
   as BLE centrals).
 - Reconnect is by stored address only. A Target with a rotating random address
   (phone / laptop / privacy-enabled device) won't reconnect after it rotates —
-  hold BOOT at power-on to rescan and re-pick. TODO: store the name and
-  reconnect by name-match.
+  use the "hold BOOT now to forget" boot-time window to rescan and re-pick.
+  TODO: store the name and reconnect by name-match.
 - One MIDI stream, one direction. No merge, filtering, or channel remap beyond
   the two transforms in `src/transforms/` — add more following the same
   pattern.

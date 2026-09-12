@@ -36,8 +36,11 @@ pio device monitor
 ## Controls
 
 One button (BOOT) does everything: **short press** moves the cursor / cycles
-a setting, **long press** selects / resets. Hold it while powering on to
-forget the saved pair and scan again.
+a setting, **long press** selects / resets. If a pair is already saved, press
+BOOT within about 1.5s of power-on (once the screen is showing something) to
+forget it and scan again — **don't** hold it in while actually powering on or
+resetting, that's the chip's own bootloader-select pin and it'll boot into the
+flashing bootloader instead of the app.
 
 ## More
 

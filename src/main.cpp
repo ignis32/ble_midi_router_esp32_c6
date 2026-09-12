@@ -417,7 +417,7 @@ static void doConnect() {
 
   // Target first (idle radio); subscribing to Source starts the notify flood.
   if (!g_tgtConn) {
-    display::showStatus("Connecting to", "TARGET ...");
+    display::showStatus("Connecting to", "TARGET ...", "hold BOOT: cancel");
     Serial.println("[MIDI-RT] connecting TARGET...");
     if (!connectWithRetry(false, BLE_CONNECT_RETRIES)) {
       if (g_connectAborted) { Serial.println("[MIDI-RT] connect cancelled (BOOT held)"); resetForRescan(); return; }
@@ -428,7 +428,7 @@ static void doConnect() {
   }
 
   if (!g_srcConn) {
-    display::showStatus("Connecting to", "SOURCE ...");
+    display::showStatus("Connecting to", "SOURCE ...", "hold BOOT: cancel");
     Serial.println("[MIDI-RT] connecting SOURCE...");
     if (!connectWithRetry(true, BLE_CONNECT_RETRIES)) {
       if (g_connectAborted) { Serial.println("[MIDI-RT] connect cancelled (BOOT held)"); resetForRescan(); return; }
@@ -561,12 +561,36 @@ void setup() {
   g_midiQ = xQueueCreate(MIDI_QUEUE_DEPTH, sizeof(RawFrame));
   xTaskCreate(midiPumpTask, "midiPump", 8192, nullptr, 6, &g_pumpTask);
 
-  const bool held = digitalRead(g_board->button) == LOW;
-  if (loadPair() && !held) {
+  // NOTE: BOOT (this board's button) is also the ESP32-C6's UART-download
+  // strapping pin. Holding it LOW across a reset makes the ROM boot straight
+  // into the flashing bootloader instead of this app -- so "was BOOT held at
+  // power-on" can never be checked from here; if it had been, we simply
+  // wouldn't be running. Instead, offer a short window to forget the stored
+  // pair *after* we're already up, once the strapping decision is long past.
+  if (loadPair()) {
+    display::showStatus("Hold BOOT now to", "forget saved pair");
+    Serial.println("[MIDI-RT] stored pair found; hold BOOT now to forget it");
+    bool forget = false;
+    uint32_t lowSince = 0;
+    for (uint32_t start = millis(); millis() - start < 1500;) {
+      if (digitalRead(g_board->button) == LOW) {
+        if (lowSince == 0) lowSince = millis();
+        if (millis() - lowSince > 150) { forget = true; break; }
+      } else {
+        lowSince = 0;
+      }
+      delay(10);
+    }
+    if (forget) {
+      Serial.println("[MIDI-RT] BOOT held -> forgetting pair");
+      forgetPair();
+    }
+  }
+
+  if (g_srcSet && g_tgtSet) {
     Serial.println("[MIDI-RT] stored pair found -> connecting");
     g_state = State::Connecting;
   } else {
-    if (held) Serial.println("[MIDI-RT] BOOT held -> forced rescan");
     forgetPair();
     startScan();
     g_state = State::ScanSource;
